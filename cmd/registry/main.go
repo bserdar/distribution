@@ -3,6 +3,7 @@ package main
 import (
 	_ "net/http/pprof"
 
+	_ "github.com/bserdar/docker-pulp-driver/pulp"
 	"github.com/docker/distribution/registry"
 	_ "github.com/docker/distribution/registry/auth/htpasswd"
 	_ "github.com/docker/distribution/registry/auth/silly"
