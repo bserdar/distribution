@@ -6,6 +6,7 @@ import (
 	_ "github.com/bserdar/docker-pulp-driver/pulp"
 	"github.com/docker/distribution/registry"
 	_ "github.com/docker/distribution/registry/auth/htpasswd"
+	_ "github.com/docker/distribution/registry/auth/rhcert"
 	_ "github.com/docker/distribution/registry/auth/silly"
 	_ "github.com/docker/distribution/registry/auth/token"
 	_ "github.com/docker/distribution/registry/proxy"
