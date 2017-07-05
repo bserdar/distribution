@@ -97,3 +97,12 @@ dep-validate:
 		(echo >&2 "+ inconsistent dependencies! what you have in vendor.conf does not match with what you have in vendor" && false)
 	@rm -Rf vendor
 	@mv .vendor.bak vendor
+
+
+TAG := itapregistry.a1.vary.redhat.com/it-pnt/redir-docker-registry:2.0
+
+build-container:
+	docker build --no-cache --tag $(TAG) .
+
+push-container:
+	docker push $(TAG)
