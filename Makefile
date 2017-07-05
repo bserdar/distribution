@@ -99,7 +99,7 @@ dep-validate:
 	@mv .vendor.bak vendor
 
 
-TAG := itapregistry.a1.vary.redhat.com/it-pnt/redir-docker-registry:2.0
+TAG := itapregistry.a1.vary.redhat.com/it-pnt/auth-redir-docker-registry:2.0
 
 build-container:
 	docker build --no-cache --tag $(TAG) .
