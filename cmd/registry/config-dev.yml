@@ -62,7 +62,9 @@ notifications:
           timeout: 1s
           threshold: 10
           backoff: 1s
-          disabled: true 
+          disabled: true
+auth:
+  rhcert:
 health:
   storagedriver:
     enabled: true
