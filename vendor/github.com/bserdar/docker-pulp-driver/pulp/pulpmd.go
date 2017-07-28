@@ -20,12 +20,25 @@ type repoMd struct {
 	Url       string `json:"url"`
 	Version   int    `json:"version"`
 	Protected bool   `json:"protected"`
+	Type      string `json:"type"`
+	// Arrays of tags and digests the image manifests reference
+	Schema2Data []string `json:"schema2_data"`
+	// Array of tags and digests that manifest lists reference
+	ManifestListData []string `json:"manifest_list_data"`
+	// Map of tag-> [digest,version]
+	Amd64Tags map[string][]interface{}
+}
+
+// Contains the file information, and the repoid described in this file
+type fileMapping struct {
+	info   os.FileInfo
+	repoId string
 }
 
 type pulpMetadata struct {
 	fs memFS
-	// File name -> fileInfo map. This is used to detect changes
-	files map[string]os.FileInfo
+	// File name -> FuleMapping map. This is used to detect changes
+	files map[string]fileMapping
 	// Repo name -> repoMd map.
 	repos map[string]repoMd
 	mu    sync.Mutex
@@ -64,7 +77,7 @@ func (md *pulpMetadata) scanDir(dir string) (bool, error) {
 		info, ok := md.files[f.Name()]
 		fileModified := false
 		if ok {
-			if !info.ModTime().Equal(f.ModTime()) {
+			if !info.info.ModTime().Equal(f.ModTime()) {
 				fileModified = true
 			}
 		} else {
@@ -73,7 +86,6 @@ func (md *pulpMetadata) scanDir(dir string) (bool, error) {
 		rootDir := md.fs.Mkdir(registryRoot + "repositories")
 		if fileModified {
 			changed = true
-			md.files[f.Name()] = f
 			var rmd repoMd
 			_, err := readJsonFile(path.Join(dir, f.Name()), &rmd)
 			if err == nil {
@@ -85,6 +97,7 @@ func (md *pulpMetadata) scanDir(dir string) (bool, error) {
 						rmd.RepoId = strings.Join(parts, "/")
 					}
 					md.repos[rmd.RepoId] = rmd
+					md.files[f.Name()] = fileMapping{info: f, repoId: rmd.RepoId}
 					// Remove the repo first
 					rootDir.Delete(parts[0])
 
@@ -116,6 +129,21 @@ func (md *pulpMetadata) scanDir(dir string) (bool, error) {
 	wg.Wait()
 
 	// Remove repos that no longer exist
+	for name, f := range md.files {
+		found := false
+		for _, info := range finfo {
+			if info.Name() == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// file no longer exists
+			delete(md.repos, f.repoId)
+			delete(md.files, name)
+		}
+	}
+
 	return changed, nil
 }
 
@@ -125,18 +153,27 @@ func (md *pulpMetadata) processManifest(repoId, url, tag string) {
 	manifest, _, err := httpGetContent(joinUrl(url, "manifests", tag))
 	if err == nil {
 		var manifestData map[string]interface{}
-		json.Unmarshal(manifest, &manifestData)
-		manifestDigest := digest.FromBytes(manifest)
-		// push the image
-		fsLayers := manifestData["fsLayers"].([]interface{})
-		layers := make([]digest.Digest, 0)
-		for _, layer := range fsLayers {
-			ilayer := layer.(map[string]interface{})
-			d, _ := digest.Parse(ilayer["blobSum"].(string))
-			layers = append(layers, d)
+		if err = json.Unmarshal(manifest, &manifestData); err == nil {
+			manifestDigest := digest.FromBytes(manifest)
+			// push the image
+			fsLayers, ok := manifestData["fsLayers"].([]interface{})
+			if ok {
+				layers := make([]digest.Digest, 0)
+				for _, layer := range fsLayers {
+					ilayer, ok := layer.(map[string]interface{})
+					if ok {
+						d, _ := digest.Parse(ilayer["blobSum"].(string))
+						layers = append(layers, d)
+					}
+				}
+				md.pushImage(repoId, tag, url, manifestDigest, layers)
+			} else {
+				fmt.Printf("Invalid manifest %s/%s:%s\n", repoId, tag, url)
+			}
+		} else {
+			fmt.Printf("Cannot parse manifest: %s\n", err.Error())
 		}
 
-		md.pushImage(repoId, tag, url, manifestDigest, layers)
 	} else {
 		fmt.Printf("Cannot retrieve %s\n", joinUrl(url, "manifests", tag))
 	}
@@ -237,7 +274,7 @@ func updateMd(dir string) {
 		fmt.Printf("UpdateMd %s\n", dir)
 		if pulpMd == nil {
 			pulpMd = &pulpMetadata{}
-			pulpMd.files = make(map[string]os.FileInfo)
+			pulpMd.files = make(map[string]fileMapping)
 			pulpMd.repos = make(map[string]repoMd)
 			pulpMd.fs = newFS()
 		}
