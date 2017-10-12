@@ -23,8 +23,10 @@ storage:
       enabled: true
     cache:
         blobdescriptor: redis
-    filesystem:
-        rootdirectory: /var/lib/registry
+    pulp:
+        pollingdir: /var/lib/registry
+        pollingInterval: 60
+        maxthreads: 100
     maintenance:
         uploadpurging:
             enabled: false
