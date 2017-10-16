@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -89,39 +90,22 @@ func (md *pulpMetadata) scanDir(dir string) (bool, error) {
 			var rmd repoMd
 			_, err := readJsonFile(path.Join(dir, f.Name()), &rmd)
 			if err == nil {
+				parts := strings.Split(rmd.RepoId, "/")
+				if parts[0] == "library" {
+					parts = parts[1:]
+					rmd.RepoId = strings.Join(parts, "/")
+				}
+				// Remove the repo first
+				rootDir.Delete(parts[0])
+				fmt.Printf("Loading %s\n", f.Name())
 				if rmd.Version == 2 {
-					fmt.Printf("Loading %s\n", f.Name())
-					parts := strings.Split(rmd.RepoId, "/")
-					if parts[0] == "library" {
-						parts = parts[1:]
-						rmd.RepoId = strings.Join(parts, "/")
-					}
 					md.repos[rmd.RepoId] = rmd
 					md.files[f.Name()] = fileMapping{info: f, repoId: rmd.RepoId}
-					// Remove the repo first
-					rootDir.Delete(parts[0])
-
-					// Get image data
-
-					// Get tags
-					tags, _, err := httpGetContent(joinUrl(rmd.Url, "tags", "list"))
-					if err == nil {
-						var tagData map[string]interface{}
-						if json.Unmarshal(tags, &tagData) == nil {
-							itags, ok := tagData["tags"]
-							if ok {
-								for _, tag := range itags.([]interface{}) {
-									stag := tag.(string)
-									fmt.Printf("%s:%s\n", rmd.RepoId, tag)
-									wg.Add(1)
-									go func() {
-										defer wg.Done()
-										md.processManifest(rmd.RepoId, rmd.Url, stag)
-									}()
-								}
-							}
-						}
-					}
+					md.processV2Data(&wg, &rmd)
+				} else if rmd.Version == 4 || rmd.Version == 3 {
+					md.repos[rmd.RepoId] = rmd
+					md.files[f.Name()] = fileMapping{info: f, repoId: rmd.RepoId}
+					md.processV2Data(&wg, &rmd)
 				}
 			}
 		}
@@ -147,43 +131,182 @@ func (md *pulpMetadata) scanDir(dir string) (bool, error) {
 	return changed, nil
 }
 
+// getStr gets a string from the map
+func getStr(m map[string]interface{}, key string) (string, bool) {
+	if v, ok := m[key]; ok {
+		return fmt.Sprint(v), true
+	}
+	return "", false
+}
+
+// getInt gets an int from the map
+func getInt(m map[string]interface{}, key string) (int, bool) {
+	if v, ok := m[key]; ok {
+		i, err := strconv.Atoi(fmt.Sprint(v))
+		if err != nil {
+			return 0, false
+		}
+		return i, true
+	}
+	return 0, false
+}
+
+func (md *pulpMetadata) processV2Data(wg *sync.WaitGroup, rmd *repoMd) {
+	// Get image data
+	// Get tags
+	tags, _, err := httpGetContent(joinUrl(rmd.Url, "tags", "list"))
+	if err == nil {
+		var tagData map[string]interface{}
+		if json.Unmarshal(tags, &tagData) == nil {
+			itags, ok := tagData["tags"]
+			if ok {
+				for _, tag := range itags.([]interface{}) {
+					stag := tag.(string)
+					fmt.Printf("%s:%s\n", rmd.RepoId, tag)
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						md.processManifest(rmd.RepoId, rmd.Url, stag)
+					}()
+				}
+			}
+		}
+	} else {
+		fmt.Printf("Cannot read %s: %s\n", rmd.RepoId, err.Error())
+	}
+}
+
+func (md *pulpMetadata) pushV1ManifestData(repoId, url, tag string,
+	manifestDigest digest.Digest,
+	manifestData map[string]interface{}) {
+	fsLayers, ok := manifestData["fsLayers"].([]interface{})
+	if ok {
+		layers := make([]digest.Digest, 0)
+		for _, layer := range fsLayers {
+			ilayer, ok := layer.(map[string]interface{})
+			if ok {
+				d, _ := digest.Parse(ilayer["blobSum"].(string))
+				layers = append(layers, d)
+			}
+		}
+		md.pushImage(repoId, tag, url, manifestDigest, layers)
+	} else {
+		fmt.Printf("Invalid manifest %s/%s:%s\n", repoId, tag, url)
+	}
+}
+
+func (md *pulpMetadata) pushV2ManifestData(repoId, url, tag string,
+	manifestDigest digest.Digest,
+	manifestData map[string]interface{}) {
+	ilayers, ok := manifestData["layers"].([]interface{})
+	if ok {
+		layers := make([]digest.Digest, 0)
+		for _, ilayer := range ilayers {
+			layer, ok := ilayer.(map[string]interface{})
+			if ok {
+				dg, ok := layer["digest"]
+				if ok {
+					mdigest, _ := digest.Parse(fmt.Sprint(dg))
+					layers = append(layers, mdigest)
+				}
+			}
+		}
+		md.pushImage(repoId, tag, url, manifestDigest, layers)
+	} else {
+		fmt.Printf("Invalid manifest %s/%s:%s\n", repoId, tag, url)
+	}
+}
+
+func (md *pulpMetadata) pushManifestList(repoId, url, tag string,
+	manifestDigest digest.Digest,
+	manifestData map[string]interface{}) {
+	manifests, ok := manifestData["manifests"]
+	if ok {
+		// push manifest list data
+		md.pushRevision(repoId, tag, manifestDigest)
+		md.pushTag(repoId, tag, manifestDigest)
+		md.pushManifestBlob(tag, url, manifestDigest)
+
+		if manifestArr, ok := manifests.([]interface{}); ok {
+			for _, iplatformManifest := range manifestArr {
+				if platformManifest, ok := iplatformManifest.(map[string]interface{}); ok {
+					idigest, ok := platformManifest["digest"]
+					if ok {
+						if _, ok := getStr(platformManifest, "mediaType"); ok {
+							dg, _ := digest.Parse(fmt.Sprint(idigest))
+							manifestData, _, err := httpGetContent(joinUrl(url, "blobs", dg.Algorithm().String(),
+								dg.Hex()[0:2], dg.Hex()))
+							if err != nil {
+								md.processManifestData(repoId, url, tag, manifestData)
+							} else {
+								fmt.Printf("Cannot read manifest for %s", dg)
+							}
+						}
+					}
+				}
+			}
+		}
+	} else {
+		fmt.Printf("Cannot get manifests %s/%s:%s", repoId, tag, url)
+	}
+}
+
 func (md *pulpMetadata) processManifest(repoId, url, tag string) {
 	// Get the manifest
 	fmt.Printf("retrieving %s\n", joinUrl(url, "manifests", tag))
 	manifest, _, err := httpGetContent(joinUrl(url, "manifests", tag))
 	if err == nil {
-		var manifestData map[string]interface{}
-		if err = json.Unmarshal(manifest, &manifestData); err == nil {
-			manifestDigest := digest.FromBytes(manifest)
-			// push the image
-			fsLayers, ok := manifestData["fsLayers"].([]interface{})
-			if ok {
-				layers := make([]digest.Digest, 0)
-				for _, layer := range fsLayers {
-					ilayer, ok := layer.(map[string]interface{})
-					if ok {
-						d, _ := digest.Parse(ilayer["blobSum"].(string))
-						layers = append(layers, d)
-					}
-				}
-				md.pushImage(repoId, tag, url, manifestDigest, layers)
-			} else {
-				fmt.Printf("Invalid manifest %s/%s:%s\n", repoId, tag, url)
-			}
-		} else {
-			fmt.Printf("Cannot parse manifest: %s\n", err.Error())
-		}
-
+		md.processManifestData(repoId, url, tag, manifest)
 	} else {
 		fmt.Printf("Cannot retrieve %s\n", joinUrl(url, "manifests", tag))
 	}
 }
 
+func (md *pulpMetadata) processManifestData(repoId, url, tag string, manifest []byte) {
+	var manifestData map[string]interface{}
+	if err := json.Unmarshal(manifest, &manifestData); err == nil {
+		manifestDigest := digest.FromBytes(manifest)
+		schemaVersion, ok := getInt(manifestData, "schemaVersion")
+		if !ok {
+			fmt.Printf("Cannot get schema version from manifest: %v", manifestData)
+		}
+		switch schemaVersion {
+		case 1:
+			// push the image
+			md.pushV1ManifestData(repoId, url, tag, manifestDigest, manifestData)
+
+		case 2:
+			if mediaType, ok := getStr(manifestData, "mediaType"); ok {
+				if mediaType == "application/vnd.docker.distribution.manifest.list.v2+json" {
+					// Manifest list
+					md.pushManifestList(repoId, url, tag, manifestDigest, manifestData)
+				} else {
+					// Manifest
+					md.pushV2ManifestData(repoId, url, tag, manifestDigest, manifestData)
+				}
+			} else {
+				fmt.Printf("Cannot get mediaType %s/%s:%s\n", repoId, tag, url)
+			}
+		}
+	} else {
+		fmt.Printf("Cannot parse manifest: %s\n", err.Error())
+	}
+}
+
 func (md *pulpMetadata) pushImage(name, tag, url string, manifestDigest digest.Digest, layerDigests []digest.Digest) {
 	fmt.Printf("pushImage %s %s %s\n", name, tag, url)
+	md.pushLayers(name, layerDigests)
+	md.pushRevision(name, tag, manifestDigest)
+	md.pushTag(name, tag, manifestDigest)
+	md.pushManifestBlob(tag, url, manifestDigest)
+	for _, l := range layerDigests {
+		md.pushLayerBlob(url, l)
+	}
+}
+
+func (md *pulpMetadata) pushLayers(name string, layerDigests []digest.Digest) {
 	imageDir := md.fs.Mkdir(registryRoot + "repositories/" + name)
 	layers := imageDir.Mkdir("_layers")
-	manifests := imageDir.Mkdir("_manifests")
 
 	// push layers
 	for _, layer := range layerDigests {
@@ -191,10 +314,20 @@ func (md *pulpMetadata) pushImage(name, tag, url string, manifestDigest digest.D
 		datadir.Create("link", []byte(layer.String()), "")
 	}
 
-	// push manifests
+}
+
+func (md *pulpMetadata) pushRevision(name, tag string, manifestDigest digest.Digest) {
+	imageDir := md.fs.Mkdir(registryRoot + "repositories/" + name)
+	manifests := imageDir.Mkdir("_manifests")
+
 	revisions := manifests.Mkdir("revisions")
 	dataDir := revisions.Mkdir(string(manifestDigest.Algorithm())).Mkdir(manifestDigest.Hex())
 	dataDir.Create("link", []byte(manifestDigest.String()), "")
+}
+
+func (md *pulpMetadata) pushTag(name, tag string, manifestDigest digest.Digest) {
+	imageDir := md.fs.Mkdir(registryRoot + "repositories/" + name)
+	manifests := imageDir.Mkdir("_manifests")
 
 	tags := manifests.Mkdir("tags")
 	tagDir := tags.Mkdir(tag)
@@ -204,20 +337,22 @@ func (md *pulpMetadata) pushImage(name, tag, url string, manifestDigest digest.D
 	index := tagDir.Mkdir("index")
 	datadir := index.Mkdir(string(manifestDigest.Algorithm())).Mkdir(manifestDigest.Hex())
 	datadir.Create("link", []byte(manifestDigest.String()), "")
-
-	// push blobs
-	blobDir := md.fs.Mkdir(registryRoot + "blobs")
-	pushBlob(blobDir, manifestDigest, joinUrl(url, "manifests", tag), false)
-	for _, l := range layerDigests {
-		pushBlob(blobDir, l, joinUrl(url, "blobs", l.String()), true)
-	}
 }
 
-func pushBlob(dir *mdirectory, d digest.Digest, url string, layer bool) {
+func (md *pulpMetadata) pushManifestBlob(tag, url string, manifestDigest digest.Digest) {
+	md.pushBlob(manifestDigest, joinUrl(url, "manifests", tag), false)
+}
+
+func (md *pulpMetadata) pushLayerBlob(url string, layerDigest digest.Digest) {
+	md.pushBlob(layerDigest, joinUrl(url, "blobs", layerDigest.String()), true)
+}
+
+func (md *pulpMetadata) pushBlob(d digest.Digest, url string, layer bool) {
+	dir := md.fs.Mkdir(registryRoot + "blobs")
 	alg := dir.Mkdir(d.Algorithm().String())
 	twodigs := alg.Mkdir(d.Hex()[0:2])
 	datadir := twodigs.Mkdir(d.Hex())
-	datadir.Create("data", nil, url)
+	datadir.Create("data", nil, url).isLayer = layer
 }
 
 func (md *pulpMetadata) isManifestRequest(blobPath string) (manifestReq bool, name string, tag string) {
